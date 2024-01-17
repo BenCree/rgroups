@@ -1,5 +1,8 @@
+import logging
+import tempfile
 from copy import deepcopy
-from typing import List, Tuple
+from typing import List, Tuple, Union
+import warnings
 
 import parmed
 from openmmforcefields.generators import SystemGenerator
@@ -24,6 +27,8 @@ except (ImportError, ModuleNotFoundError):
 from openff.toolkit.topology import Molecule as OFFMolecule
 
 
+logger = logging.getLogger(__name__)
+
 def fix_receptor(input_file: str, output_file: str, pH: float = 7.0):
     """
     Use PDBFixer to correct the input and add hydrogens with the given pH.
@@ -44,7 +49,7 @@ def _can_use_ani2x(molecule: OFFMolecule) -> bool:
     """
     Check if ani2x can be used for this molecule by inspecting the elements.
     """
-    mol_elements = set([atom.element.symbol for atom in molecule.atoms])
+    mol_elements = set([atom.symbol for atom in molecule.atoms])
     ani2x_elements = {"H", "C", "N", "O", "S", "F", "Cl"}
     if mol_elements - ani2x_elements:
         # if there is any difference in the sets or a net charge ani2x can not be used.
@@ -81,13 +86,13 @@ ForceField = Literal["openff", "gaff"]
 
 def optimise_in_receptor(
     ligand: RMol,
-    receptor_file: str,
+    receptor_file: Union[str, app.PDBFile],
     ligand_force_field: ForceField,
     use_ani: bool = True,
     sigma_scale_factor: float = 0.8,
     relative_permittivity: float = 4,
     water_model: str = "tip3p.xml",
-    platform_name: str = "CPU",
+    platform_name: str = "CPU"
 ) -> Tuple[RMol, List[float]]:
     """
     For each of the input molecule conformers optimise the system using the chosen force field with the receptor held fixed.
@@ -124,7 +129,8 @@ def optimise_in_receptor(
     platform = Platform.getPlatformByName(platform_name.upper())
 
     # assume the receptor has already been fixed and hydrogens have been added.
-    receptor = app.PDBFile(receptor_file)
+    if type(receptor_file) is str:
+        receptor_file = app.PDBFile(receptor_file)
     # receptor forcefield
     receptor_ff = "amber14/protein.ff14SB.xml"
 
@@ -139,13 +145,12 @@ def optimise_in_receptor(
     system_generator = SystemGenerator(
         forcefields=forcefields,
         small_molecule_forcefield=ligand_force_fields[ligand_force_field],
-        cache="db.json",
+        cache=None,
         molecules=openff_mol,
     )
-
     # now make a combined receptor and ligand topology
     parmed_receptor = parmed.openmm.load_topology(
-        receptor.topology, xyz=receptor.positions
+        receptor_file.topology, xyz=receptor_file.positions
     )
     parmed_ligand = parmed.openmm.load_topology(
         openff_mol.to_topology().to_openmm(), xyz=openff_mol.conformers[0]
@@ -166,8 +171,12 @@ def optimise_in_receptor(
     if use_ani and _can_use_ani2x(openff_mol):
         print("using ani2x")
         potential = MLPotential("ani2x", platform_name=platform_name)
+
+        # save the torch model animodel.pt to a temporary file to ensure this is thread safe
+        _, tmpfile = tempfile.mkstemp()
+
         complex_system = potential.createMixedSystem(
-            complex_structure.topology, system, ligand_idx
+            complex_structure.topology, system, ligand_idx, filename=tmpfile
         )
     else:
         print("Using force field")
@@ -191,7 +200,9 @@ def optimise_in_receptor(
     )
 
     # save the receptor coords as they should be consistent
-    receptor_coords = parmed_receptor.positions
+    receptor_coords = unit.Quantity(
+        parmed_receptor.coordinates.tolist(), unit=unit.angstrom
+    )
 
     # loop over the conformers and energy minimise and store the final positions
     final_mol = RMol(deepcopy(ligand))
@@ -201,9 +212,8 @@ def optimise_in_receptor(
         tqdm(openff_mol.conformers, desc="Optimising conformer: ", ncols=80)
     ):
         # make the ligand coords
-        lig_coords = conformer.value_in_unit(unit.angstrom)
-        # make the vec3 list
-        lig_vec = [openmm.Vec3(*i) for i in lig_coords] * unit.angstrom
+        lig_vec = unit.Quantity([c.m.tolist() for c in conformer], unit=unit.angstrom)
+
         complex_coords = receptor_coords + lig_vec
         # set the initial positions
         simulation.context.setPositions(complex_coords)
@@ -212,14 +222,27 @@ def optimise_in_receptor(
 
         # write out the final coords
         min_state = simulation.context.getState(getPositions=True, getEnergy=True)
-        energies.append(
-            min_state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
-        )
         positions = min_state.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
         final_conformer = Chem.Conformer()
         for j, coord in enumerate(positions[ligand_idx[0] :]):
             atom_position = Point3D(*coord)
             final_conformer.SetAtomPosition(j, atom_position)
+
+        # ignore minimised conformers that have very long bonds
+        # this is a temporary fix to ANI generated
+        has_long_bonds = False
+        for bond in final_mol.GetBonds():
+            atom_from = final_conformer.GetAtomPosition(bond.GetBeginAtomIdx())
+            atom_to = final_conformer.GetAtomPosition(bond.GetEndAtomIdx())
+            if atom_from.Distance(atom_to) > 3:
+                has_long_bonds = True
+                break
+        if has_long_bonds:
+            continue
+
+        energies.append(
+            min_state.getPotentialEnergy().value_in_unit(unit.kilocalories_per_mole)
+        )
         final_mol.AddConformer(final_conformer, assignId=True)
 
     return final_mol, energies
